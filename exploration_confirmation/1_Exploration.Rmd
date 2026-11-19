@@ -1,0 +1,1746 @@
+---
+title: "King County Housing: Descriptive Exploration"
+subtitle: "Raw-data audit, latest-sale selection, exploration–confirmation split, distributions, scatterplots, and correlations"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+params:
+  data_file: "kc_house_data.csv"
+  random_seed: 123
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+
+# install.packages("skimr")
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(lmtest)
+library(sandwich)
+library(emmeans)
+# library(skimr)
+```
+
+
+
+```{r load-data}
+
+housing_raw <- read_csv(
+  params$data_file,
+  col_types = cols(
+    id = col_character(),
+    date = col_character(),
+    zipcode = col_character(),
+    .default = col_guess()
+  ),
+  show_col_types = FALSE
+)
+
+sale_dates <- as.Date(substr(housing_raw$date, 1, 8), format = "%Y%m%d")
+```
+
+
+```{r raw_data_overview}
+raw_overview <- tibble(
+  Metric = c(
+    "Number of sale records",
+    "Number of columns",
+    "Unique property IDs",
+    "Rows beyond first occurrence of a property ID",
+    "Earliest sale date",
+    "Latest sale date"
+  ),
+  Value = c(
+    format(nrow(housing_raw), big.mark = ",", scientific = FALSE),
+    ncol(housing_raw),
+    format(n_distinct(housing_raw$id), big.mark = ",", scientific = FALSE),
+    sum(duplicated(housing_raw$id)),
+    as.character(min(sale_dates, na.rm = TRUE)),
+    as.character(max(sale_dates, na.rm = TRUE))
+  )
+)
+
+kable(raw_overview, caption = "Raw dataset overview")
+```
+
+
+
+```{r filter_dates_NO_LONGER}
+# Filter Sale Dates
+# 
+# The initial portion of the dataset is excluded to restrict the analysis to a complete 12-month period (May 28, 2014, to May 27, 2015) and avoid overrepresenting seasonal patterns in housing sales.
+
+
+housing_filtered <- housing_raw %>%
+  mutate(sale_date = sale_dates)%>%
+  filter(
+    between(sale_date, as.Date("2014-05-28"), as.Date("2015-05-27"))
+  )
+
+filtered_overview <- tibble(
+  Metric = c(
+    "Number of sale records",
+    "Number of columns",
+    "Unique property IDs",
+    "Rows beyond first occurrence of a property ID",
+    "Earliest sale date",
+    "Latest sale date"
+  ),
+  Value = c(
+    format(nrow(housing_filtered), big.mark = ",", scientific = FALSE),
+    ncol(housing_filtered),
+    format(n_distinct(housing_filtered$id), big.mark = ",", scientific = FALSE),
+    sum(duplicated(housing_filtered$id)),
+    as.character(min(housing_filtered$sale_date, na.rm = TRUE)),
+    as.character(max(housing_filtered$sale_date, na.rm = TRUE))
+  )
+)
+
+kable(filtered_overview, caption = "Filtered dataset overview")
+```
+
+
+```{r create_age_renovation_variables}
+housing_filtered <- housing_filtered %>%
+  mutate(
+    sale_year = as.integer(format(sale_date, "%Y")),
+    age = sale_year - yr_built,
+    renovated = if_else(yr_renovated > 0, 1L, 0L),
+    age_since_renovation = if_else(
+      renovated == 1,
+      sale_year - yr_renovated,
+      0
+    )
+  )
+```
+
+
+
+```{r data_summary_1}
+glimpse(housing_filtered)
+```
+
+
+```{r data_summary_2}
+summary(housing_filtered)
+```
+
+
+```{r filter_out_negative_ages}
+negative_age_overview <- tibble(
+  Metric = c(
+    "Records with negative age",
+    "Records with negative age since renovation",
+    "Total records with either negative age"
+  ),
+  Count = c(
+    sum(housing_filtered$age < 0),
+    sum(housing_filtered$age_since_renovation < 0),
+    sum(
+      housing_filtered$age < 0 |
+      housing_filtered$age_since_renovation < 0
+    )
+  )
+)
+
+kable(negative_age_overview, caption = "Invalid property and renovation ages")
+
+# Remove records with negative ages
+housing_filtered <- housing_filtered %>%
+  filter(
+    age >= 0,
+    age_since_renovation >= 0
+  )
+```
+
+
+
+```{r raw-missingness}
+missing_summary <- tibble(
+  Variable = names(housing_filtered),
+  Missing = vapply(housing_filtered, function(x) sum(is.na(x)), integer(1))
+) %>%
+  mutate(`Missing (%)` = round(100 * Missing / nrow(housing_raw), 2))
+
+kable(missing_summary, caption = "Missing values in the raw data")
+```
+
+
+
+
+## 2. Duplicate house IDs and latest-sale selection
+
+The same `id` can appear multiple times because a house was sold more than once in the observation period. First, count **distinct house IDs with more than one sale record** (not just the number of surplus rows). Then keep the record with the **latest sale date** for each house. This step happens **before** the exploration–confirmation split.
+
+If two rows for a house share the same latest sale date, the first occurrence in the original CSV is retained as a reproducible tie-breaker. An unparseable sale date stops the analysis rather than silently selecting an arbitrary record.
+
+```{r duplicate_ids_latest_sale}
+housing_dated <- housing_filtered %>%
+  mutate(
+    sale_date = as.Date(substr(date, 1, 8), format = "%Y%m%d"),
+    original_row = row_number()
+  )
+
+if (anyNA(housing_dated$sale_date)) {
+  stop("Some sale dates could not be parsed; review the raw data before filtering.")
+}
+
+id_sale_counts <- housing_dated %>%
+  count(id, name = "Sale_records")
+
+repeated_ids <- id_sale_counts %>%
+  filter(Sale_records > 1)
+
+housing_latest <- housing_dated %>%
+  arrange(id, desc(sale_date), original_row) %>%
+  distinct(id, .keep_all = TRUE) %>%
+  select(-sale_date, -original_row)
+
+stopifnot(
+  nrow(housing_latest) == n_distinct(housing_filtered$id),
+  anyDuplicated(housing_latest$id) == 0
+)
+
+duplicate_summary <- tibble(
+  Metric = c(
+    "Raw sale records",
+    "Unique house IDs",
+    "House IDs appearing more than once",
+    "Extra sale records from repeated house IDs",
+    "Records retained (latest sale per house)"
+  ),
+  Count = c(
+    nrow(housing_filtered),
+    n_distinct(housing_filtered$id),
+    nrow(repeated_ids),
+    sum(repeated_ids$Sale_records - 1),
+    nrow(housing_latest)
+  )
+)
+
+kable(
+  duplicate_summary,
+  format.args = list(big.mark = ","),
+  caption = "Repeated-house audit and latest-sale filtering"
+)
+```
+
+
+## 3. Allocate 30% to exploration and 70% to confirmation
+
+We now split **`housing_latest`**, which has exactly one latest-sale row per house. A fixed random seed makes this allocation reproducible. All subsequent descriptive statistics, plots, and correlations use the exploration sample only.
+
+```{r split_data}
+set.seed(params$random_seed)
+
+property_ids <- housing_latest$id
+exploration_ids <- sample(
+  property_ids,
+  size = round(0.30 * length(property_ids)),
+  replace = FALSE
+)
+
+housing_exploration <- housing_latest %>%
+  filter(id %in% exploration_ids)
+
+housing_confirmation <- housing_latest %>%
+  filter(!id %in% exploration_ids)
+
+stopifnot(
+  nrow(housing_exploration) + nrow(housing_confirmation) == nrow(housing_latest),
+  length(intersect(housing_exploration$id, housing_confirmation$id)) == 0,
+  anyDuplicated(housing_exploration$id) == 0,
+  anyDuplicated(housing_confirmation$id) == 0
+)
+
+split_summary <- tibble(
+  Sample = c("Exploration", "Confirmation", "Total"),
+  `Sale records` = c(
+    nrow(housing_exploration),
+    nrow(housing_confirmation),
+    nrow(housing_latest)
+  ),
+  `Percent of records` = c(
+    100 * nrow(housing_exploration) / nrow(housing_latest),
+    100 * nrow(housing_confirmation) / nrow(housing_latest),
+    100
+  ),
+  `Unique properties` = c(
+    n_distinct(housing_exploration$id),
+    n_distinct(housing_confirmation$id),
+    n_distinct(housing_latest$id)
+  )
+) %>%
+  mutate(`Percent of records` = round(`Percent of records`, 2))
+
+kable(split_summary, caption = "Exploration/confirmation allocation (latest sale per house)")
+```
+
+
+## 4. Exploratory descriptive statistics
+
+
+```{r exploratory_descriptives}
+numeric_variables <- names(housing_exploration)[
+  vapply(housing_exploration, is.numeric, logical(1))
+]
+
+numeric_variables <- setdiff(numeric_variables, c("id", "zipcode"))
+
+numeric_summary <- bind_rows(lapply(numeric_variables, function(variable) {
+  x <- housing_exploration[[variable]]
+  tibble(
+    Variable = variable,
+    N = sum(!is.na(x)),
+    Mean = mean(x, na.rm = TRUE),
+    SD = sd(x, na.rm = TRUE),
+    P0 = min(x, na.rm = TRUE),
+    P25 = unname(quantile(x, 0.25, na.rm = TRUE)),
+    P50 = median(x, na.rm = TRUE),
+    P75 = unname(quantile(x, 0.75, na.rm = TRUE)),
+    P100 = max(x, na.rm = TRUE)
+  )
+}))
+
+kable(
+  numeric_summary,
+  digits = 2,
+  format.args = list(big.mark = ",", scientific = FALSE),
+  caption = "Numeric summaries for the 30% exploration sample"
+)
+```
+
+Note that `waterfront` is binary and `view`, `condition`, and `grade` use ordered codes. Their numerical summaries may be useful for an audit, but distributions by category are generally easier to interpret than their means.
+
+## 5. Univariate distributions
+
+### Histograms of key quantitative variables
+
+```{r univariate_histograms, fig.width=11, fig.height=10}
+histogram_variables <- c(
+  "price", "sqft_living", "sqft_lot",
+  "age", "age_since_renovation"
+)
+
+histogram_data <- housing_exploration %>%
+  mutate(
+    age_since_renovation = if_else(
+      renovated == 1, age_since_renovation, NA_real_
+    )
+  ) %>%
+  select(all_of(histogram_variables)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value",
+    values_drop_na = TRUE
+  ) %>%
+  mutate(Variable = factor(Variable, levels = histogram_variables))
+
+ggplot(histogram_data, aes(x = Value)) +
+  geom_histogram(bins = 35, fill = "#4472A5", color = "white") +
+  facet_wrap(~Variable, scales = "free", ncol = 2) +
+  labs(
+    title = "Distributions of key housing variables",
+    subtitle = "30% exploration sample; renovation age includes only renovated properties",
+    x = "Value (units vary by panel)",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+```{r price-distribution, fig.width=9, fig.height=5}
+ggplot(housing_exploration, aes(x = price)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Distribution of Home Sale Prices",
+    subtitle = "30% exploration sample",
+    x = "Home Sale Price",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+```{r price-distribution-capped, fig.width=9, fig.height=5}
+ggplot(housing_exploration, aes(x = price)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Distribution of Home Sale Prices",
+    subtitle = "30% exploration sample; y-axis capped at 100 sales",
+    x = "Home Sale Price",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+```{r living-area-distribution, fig.width=9, fig.height=5}
+ggplot(housing_exploration, aes(x = sqft_living)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Distribution of Living Area",
+    subtitle = "30% exploration sample",
+    x = "Living Area (Sq. Ft.)",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+```{r living-area-distribution-capped, fig.width=9, fig.height=5}
+ggplot(housing_exploration, aes(x = sqft_living)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Distribution of Living Area",
+    subtitle = "30% exploration sample; y-axis capped at 100 sales",
+    x = "Living Area (Sq. Ft.)",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+
+### Log-scale views of right-skewed variables
+
+A small number of expensive houses or very large lots can visually compress most observations in a standard histogram. For strictly positive observations, log10 scaling makes the shape of the distribution easier to see. These plots **do not remove or modify observations used in later analyses**.
+
+```{r univariate_log_histograms, fig.width=10, fig.height=5}
+log_variables <- c("price", "sqft_living", "sqft_lot")
+
+log_histogram_data <- housing_exploration %>%
+  select(all_of(log_variables)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value), Value > 0) %>%
+  mutate(
+    LogValue = log(Value),
+    Variable = factor(Variable, levels = log_variables)
+  )
+
+ggplot(log_histogram_data, aes(x = LogValue)) +
+  geom_histogram(bins = 35, fill = "#527F6D", color = "white") +
+  facet_wrap(~Variable, scales = "free", nrow = 1) +
+  labs(
+    title = "Natural log-transformed distributions",
+    subtitle = "30% exploration sample",
+    x = "ln(value)",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+### Frequency distributions of discrete and categorical variables
+
+```{r univariate-bar-charts, fig.width=11, fig.height=10}
+bar_variables <- c(
+  "bedrooms", "bathrooms", "waterfront", 
+  "view", "condition", "grade", "renovated"
+)
+
+bar_data <- housing_exploration %>%
+  select(all_of(bar_variables)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Value = factor(Value, levels = sort(unique(Value))),
+    Variable = factor(Variable, levels = bar_variables)
+  )
+
+ggplot(bar_data, aes(x = Value)) +
+  geom_bar(fill = "#4472A5") +
+  facet_wrap(~Variable, scales = "free", ncol = 2) +
+  labs(
+    title = "Frequency distributions of discrete variables",
+    subtitle = "30% exploration sample",
+    x = "Recorded value",
+    y = "Number of sales"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r grade-frequency}
+grade_frequency <- housing_exploration %>%
+  count(grade, name = "Count") %>%
+  complete(grade = 1:13, fill = list(Count = 0)) %>%
+  mutate(Percentage = 100 * Count / sum(Count)) %>%
+  arrange(grade)
+
+kable(
+  grade_frequency,
+  digits = 2,
+  caption = "Frequency distribution of construction grades"
+)
+```
+
+
+```{r group-housing-grades}
+housing_exploration <- housing_exploration %>%
+  mutate(
+    grade_ = factor(
+      case_when(
+        grade <= 5 ~ "1-5",
+        grade >= 12 ~ "12-13",
+        TRUE ~ as.character(grade)
+      ),
+      levels = c("7", "1-5", "6", as.character(8:11), "12-13")
+    )
+  )
+
+grade_group_frequency <- housing_exploration %>%
+  count(grade_, name = "Count") %>%
+  mutate(Percentage = 100 * Count / sum(Count)) %>%
+  arrange(as.numeric(sub("-.*", "", as.character(grade_))))
+
+kable(
+  grade_group_frequency,
+  digits = 2,
+  caption = "Frequency distribution of grouped construction grades"
+)
+```
+
+
+## 6. Bivariate associations with sale price (exploration sample)
+
+### Scatterplots: sale price versus quantitative characteristics
+
+We focus on living area, lot area, surrounding-home living area, and construction year. The horizontal axis uses its own scale in each panel; the vertical axis is consistently sale price in dollars.
+
+```{r bivariate-scatterplots, fig.width=11, fig.height=9}
+scatter_variables <- c(
+  "sqft_living", "sqft_lot", "age", "age_since_renovation"
+)
+
+scatter_data <- housing_exploration %>%
+  mutate(
+    age_since_renovation = if_else(
+      renovated == 1, age_since_renovation, NA_real_
+    )
+  ) %>%
+  select(price, all_of(scatter_variables)) %>%
+  pivot_longer(
+    cols = all_of(scatter_variables),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(price), !is.na(Value)) %>%
+  mutate(Variable = factor(Variable, levels = scatter_variables))
+
+ggplot(scatter_data, aes(x = Value, y = price)) +
+  geom_point(alpha = 0.16, size = 0.7, color = "#38658D") +
+  geom_smooth(method = "lm", formula = y ~ x,
+              se = FALSE, linewidth = 0.8, color = "#C05A46") +
+  facet_wrap(~Variable, scales = "free_x", ncol = 2) +
+  scale_y_continuous(labels = function(x) {
+    paste0("$", format(x, big.mark = ",", scientific = FALSE, trim = TRUE))
+  }) +
+  labs(
+    title = "Housing characteristics and sale price",
+    subtitle = "30% exploration sample; renovation age includes only renovated properties",
+    x = "Characteristic value (units vary by panel)",
+    y = "Sale price (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+### Closer look: living area versus sale price on log scales
+
+This alternative view can reveal patterns that are difficult to see when very large houses and high-price sales dominate the original axes. **Neither the log-scale relationship nor the fitted line is a causal estimate.**
+
+```{r bivariate-log-scatter, fig.width=9, fig.height=6}
+log_scatter_data <- housing_exploration %>%
+  filter(!is.na(price), !is.na(sqft_living),
+         price > 0, sqft_living > 0)
+
+ggplot(log_scatter_data, aes(x = sqft_living, y = price)) +
+  geom_point(alpha = 0.20, size = 0.8, color = "#38658D") +
+  geom_smooth(
+    method = "lm", formula = y ~ x,
+    aes(color = "OLS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  geom_smooth(
+    method = "loess", formula = y ~ x,
+    aes(color = "LOESS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  scale_color_manual(
+    name = "Trend line",
+    values = c("OLS" = "#C05A46", "LOESS" = "#4472A5"),
+    breaks = c("OLS", "LOESS")
+  ) +
+  scale_x_log10() +
+  scale_y_log10(labels = function(x) {
+    paste0("$", format(x, big.mark = ",", scientific = FALSE, trim = TRUE))
+  }) +
+  labs(
+    title = "Living area and sale price (log–log axes)",
+    subtitle = "Exploration sample; unadjusted linear and nonlinear associations",
+    x = "Living area (sq. ft., log scale)",
+    y = "Sale price (USD, log scale)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title.position = "plot",
+    legend.position = "bottom"
+  )
+```
+
+
+
+
+
+```{r bivariate-log-scatter-lot, fig.width=9, fig.height=6}
+log_scatter_lot_data <- housing_exploration %>%
+  filter(!is.na(price), !is.na(sqft_lot),
+         price > 0, sqft_lot > 0)
+
+ggplot(log_scatter_lot_data, aes(x = sqft_lot, y = price)) +
+  geom_point(alpha = 0.20, size = 0.8, color = "#38658D") +
+  geom_smooth(
+    method = "lm", formula = y ~ x,
+    aes(color = "OLS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  geom_smooth(
+    method = "loess", formula = y ~ x,
+    aes(color = "LOESS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  scale_color_manual(
+    name = "Trend line",
+    values = c("OLS" = "#C05A46", "LOESS" = "#4472A5"),
+    breaks = c("OLS", "LOESS")
+  ) +
+  scale_x_log10() +
+  scale_y_log10(labels = function(x) {
+    paste0("$", format(x, big.mark = ",", scientific = FALSE, trim = TRUE))
+  }) +
+  labs(
+    title = "Lot area and sale price (log–log axes)",
+    subtitle = "Exploration sample; unadjusted linear and nonlinear associations",
+    x = "Lot area (sq. ft., log scale)",
+    y = "Sale price (USD, log scale)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title.position = "plot",
+    legend.position = "bottom"
+  )
+```
+
+
+
+
+```{r age-price-log, fig.width=9, fig.height=6}
+ggplot(housing_exploration, aes(x = age, y = price)) +
+  geom_point(alpha = 0.16, size = 0.7, color = "#38658D") +
+  geom_smooth(
+    method = "lm", formula = y ~ x,
+    aes(color = "OLS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  geom_smooth(
+    method = "loess", formula = y ~ x,
+    aes(color = "LOESS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  scale_color_manual(
+    name = "Trend line",
+    values = c("OLS" = "#C05A46", "LOESS" = "#4472A5"),
+    breaks = c("OLS", "LOESS")
+  ) +
+  scale_y_log10(labels = scales::label_dollar()) +
+  labs(
+    title = "Property age and sale price (semi-log axes)",
+    subtitle = "30% exploration sample; unadjusted linear and nonlinear associations",
+    x = "Property age (years)",
+    y = "Sale price (USD, log scale)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title.position = "plot",
+    legend.position = "bottom"
+  )
+```
+
+
+
+```{r age-price-cutoff, fig.width=9, fig.height=6}
+ggplot(housing_exploration, aes(x = age, y = price)) +
+  geom_point(alpha = 0.16, size = 0.7, color = "#38658D") +
+  geom_smooth(
+    method = "lm", formula = y ~ x,
+    aes(color = "OLS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  geom_smooth(
+    method = "loess", formula = y ~ x,
+    aes(color = "LOESS"),
+    se = FALSE, linewidth = 0.8
+  ) +
+  scale_color_manual(
+    name = "Trend line",
+    values = c("OLS" = "#C05A46", "LOESS" = "#4472A5"),
+    breaks = c("OLS", "LOESS")
+  ) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  coord_cartesian(ylim = c(0, 2000000)) +
+  labs(
+    title = "Property age and sale price",
+    subtitle = "30% exploration sample; y-axis visually capped at $2,000,000",
+    x = "Property age (years)",
+    y = "Sale price (USD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title.position = "plot",
+    legend.position = "bottom"
+  )
+```
+
+
+
+### Sale-price distributions across coded property characteristics
+
+For discrete characteristics such as waterfront status, view quality, and construction grade, boxplots communicate group differences more clearly than scatterplots. The log10 sale-price axis improves readability across the wide range of recorded prices.
+
+```{r bivariate-boxplots, fig.width=10, fig.height=15}
+group_variables <- c(
+  "grade", "waterfront", "view", "condition", "renovated"
+)
+
+price_by_group <- housing_exploration %>%
+  select(price, all_of(group_variables)) %>%
+  pivot_longer(
+    cols = all_of(group_variables),
+    names_to = "Variable",
+    values_to = "Level"
+  ) %>%
+  filter(!is.na(price), price > 0, !is.na(Level)) %>%
+  mutate(
+    Level = factor(Level, levels = sort(unique(Level))),
+    Variable = factor(Variable, levels = group_variables)
+  )
+
+ggplot(price_by_group, aes(x = Level, y = price)) +
+  geom_boxplot(
+    fill = "#A9C7D8", color = "#385C77",
+    outlier.alpha = 0.18
+  ) +
+  facet_wrap(~Variable, scales = "free_x", ncol = 1) +
+  scale_y_log10(labels = function(x) {
+    paste0("$", format(x, big.mark = ",", scientific = FALSE, trim = TRUE))
+  }) +
+  labs(
+    title = "Sale-price distributions by property characteristics",
+    subtitle = "30% exploration sample; boxplots on a logarithmic price axis",
+    x = "Category code",
+    y = "Sale price (USD, log scale)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+**Interpretation reminder:** Scatterplots and group comparisons show marginal patterns. A later descriptive multiple regression can summarize *adjusted associations*, but it does not by itself make those associations causal.
+
+## 7. Exploratory correlation matrix
+
+The matrix below uses selected quantitative variables from the **30% exploration sample**, including sale price. We intentionally exclude `id` and `zipcode` (identifiers), `lat` and `long` (coordinates), and the coded categorical/ordinal variables (`waterfront`, `view`, `condition`, `grade`). We also exclude `yr_renovated`, whose value of zero indicates no recorded renovation rather than a literal year.
+
+**Important:** Pearson correlations describe *unadjusted linear associations*. They are not regression coefficients, do not account for ZIP-code fixed effects, and do not establish causality.
+
+```{r correlation-matrix}
+correlation_variables <- c(
+  "price",
+  "bedrooms",
+  "bathrooms",
+  "sqft_living",
+  "sqft_lot",
+  "floors",
+  "sqft_above",
+  "sqft_basement",
+  "yr_built",
+  "sqft_living15",
+  "sqft_lot15"
+)
+
+correlation_data <- housing_exploration %>%
+  select(all_of(correlation_variables))
+
+correlation_matrix <- cor(
+  correlation_data,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+kable(
+  round(correlation_matrix, 2),
+  caption = "Pearson correlation matrix: exploration sample"
+)
+```
+
+### Correlation heatmap
+
+```{r correlation-heatmap-spearman, fig.width=7, fig.height=5}
+correlation_variables_spearman <- c(
+  "price", "grade", "sqft_living",
+  "sqft_lot", "age",
+  "condition", "renovated"
+)
+
+correlation_matrix_spearman <- housing_exploration %>%
+  select(all_of(correlation_variables_spearman)) %>%
+  cor(method = "spearman", use = "complete.obs")
+
+correlations_long_spearman <- as.data.frame(as.table(correlation_matrix_spearman)) %>%
+  rename(Variable_1 = Var1, Variable_2 = Var2, Correlation = Freq) %>%
+  mutate(
+    Variable_1 = factor(Variable_1, levels = rev(correlation_variables_spearman)),
+    Variable_2 = factor(Variable_2, levels = correlation_variables_spearman)
+  )
+
+ggplot(correlations_long_spearman, aes(x = Variable_2, y = Variable_1, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 2.7) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B35806",
+    midpoint = 0, limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlations among key housing variables",
+    subtitle = "Spearman rank correlation",
+    x = NULL, y = NULL, fill = "Spearman \u03C1"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 50, hjust = 1),
+    plot.title.position = "plot"
+  )
+```
+
+
+
+
+```{r correlation-heatmap-pearson, fig.width=7, fig.height=5}
+correlation_variables_pearson <- c(
+  "price", "grade", "sqft_living",
+  "sqft_lot", "age",
+  "condition", "renovated"
+)
+
+correlation_matrix_pearson <- housing_exploration %>%
+  select(all_of(correlation_variables_pearson)) %>%
+  cor(method = "pearson", use = "complete.obs")
+
+correlations_long_pearson <- as.data.frame(as.table(correlation_matrix_pearson)) %>%
+  rename(Variable_1 = Var1, Variable_2 = Var2, Correlation = Freq) %>%
+  mutate(
+    Variable_1 = factor(Variable_1, levels = rev(correlation_variables_pearson)),
+    Variable_2 = factor(Variable_2, levels = correlation_variables_pearson)
+  )
+
+ggplot(correlations_long_pearson, aes(x = Variable_2, y = Variable_1, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 2.7) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B35806",
+    midpoint = 0, limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlations among key housing variables",
+    subtitle = "Pearson correlation",
+    x = NULL, y = NULL, fill = "Pearson r"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 50, hjust = 1),
+    plot.title.position = "plot"
+  )
+```
+
+
+### Variables most correlated with sale price
+
+```{r correlations-with-price}
+price_correlations <- tibble(
+  Variable = rownames(correlation_matrix_spearman),
+  Spearman = as.numeric(correlation_matrix_spearman[, "price"]),
+  Pearson = as.numeric(correlation_matrix_pearson[Variable, "price"])
+) %>%
+  filter(Variable != "price") %>%
+  arrange(desc(abs(Spearman)))
+
+kable(
+  price_correlations,
+  digits = 3,
+  caption = "Exploratory correlations with sale price, sorted by absolute Spearman correlation"
+)
+```
+
+## 8. Modeling
+
+```{r model_2-living-area}
+model_2 <- lm(
+  log(price) ~ log(sqft_living),
+  data = housing_exploration
+)
+
+coeftest(model_2, vcov. = vcovHC(model_2))
+cat("R-squared:", round(summary(model_2)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_2)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_2), "\n")
+```
+
+
+
+```{r model-2-plot-preparation}
+loess_data <- housing_exploration %>%
+  mutate(
+    log_price = log(price),
+    log_sqft_living = log(sqft_living)
+  )
+
+loess_model_2 <- loess(
+  log_price ~ log_sqft_living,
+  data = loess_data,
+  span = 0.75
+)
+
+# Create prediction dataframe
+model_2_plot_data <- tibble(
+  log_sqft_living = seq(
+    min(loess_data$log_sqft_living),
+    max(loess_data$log_sqft_living),
+    length.out = 500
+  )
+)
+
+# Create living area variable
+model_2_plot_data$sqft_living <- exp(
+  model_2_plot_data$log_sqft_living
+)
+
+# Generate OLS predictions
+model_2_plot_data$OLS <- predict(
+  model_2,
+  newdata = model_2_plot_data
+)
+
+# Generate LOESS predictions
+model_2_plot_data$LOESS <- predict(
+  loess_model_2,
+  newdata = model_2_plot_data
+)
+
+# Reshape for plotting
+model_2_plot_data <- model_2_plot_data %>%
+  pivot_longer(
+    cols = c(OLS, LOESS),
+    names_to = "Model",
+    values_to = "estimated_log_price"
+  ) %>%
+  mutate(
+    estimated_price = exp(estimated_log_price)
+  )
+```
+
+
+```{r model-2-loess-log-log, fig.width=9, fig.height=5}
+ggplot() +
+  geom_point(
+    data = loess_data,
+    aes(x = log_sqft_living, y = log_price),
+    alpha = 0.15,
+    size = 0.8,
+    color = "gray50"
+  ) +
+  geom_line(
+    data = model_2_plot_data,
+    aes(
+      x = log_sqft_living,
+      y = estimated_log_price,
+      color = Model
+    ),
+    linewidth = 1
+  ) +
+  scale_color_manual(
+    values = c("OLS" = "#C05A46", "LOESS" = "#4472A5"),
+    breaks = c("OLS", "LOESS")
+  ) +
+  labs(
+    title = "Relationship Between Log Living Area and Log Sale Price",
+    subtitle = "Comparison of OLS and LOESS fits",
+    x = "Log of Living Area",
+    y = "Log of Sale Price",
+    color = "Trend Line"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r model-2-loess-exponentiated, fig.width=9, fig.height=5}
+ggplot() +
+  geom_point(
+    data = housing_exploration,
+    aes(x = sqft_living, y = price),
+    alpha = 0.15,
+    size = 0.8,
+    color = "gray50"
+  ) +
+  geom_line(
+    data = model_2_plot_data,
+    aes(
+      x = sqft_living,
+      y = estimated_price,
+      color = Model
+    ),
+    linewidth = 1
+  ) +
+  scale_color_manual(
+    values = c("OLS" = "#C05A46", "LOESS" = "#4472A5"),
+    breaks = c("OLS", "LOESS")
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Relationship Between Living Area and Home Sale Price",
+    subtitle = "Comparison of back-transformed OLS and LOESS fits",
+    x = "Living Area (Sq. Ft.)",
+    y = "Home Sale Price",
+    color = "Trend Line",
+    caption = "Fitted curves represent estimated geometric mean sale prices."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+```{r model-2-quadratic}
+model_2_quadratic <- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2),
+  data = housing_exploration
+)
+
+coeftest(
+  model_2_quadratic,
+  vcov. = vcovHC(model_2_quadratic)
+)
+
+cat("R-squared:", round(summary(model_2_quadratic)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_2_quadratic)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_2_quadratic), "\n")
+```
+
+
+```{r model-2-comparison-preparation}
+model_2_comparison_data <- tibble(
+  log_sqft_living = seq(
+    min(loess_data$log_sqft_living),
+    max(loess_data$log_sqft_living),
+    length.out = 500
+  )
+)
+
+model_2_comparison_data$sqft_living <- exp(
+  model_2_comparison_data$log_sqft_living
+)
+
+# Simple OLS predictions
+model_2_comparison_data$OLS <- predict(
+  model_2,
+  newdata = model_2_comparison_data
+)
+
+# Quadratic OLS predictions
+model_2_comparison_data$Quadratic <- predict(
+  model_2_quadratic,
+  newdata = model_2_comparison_data
+)
+
+# LOESS predictions
+model_2_comparison_data$LOESS <- predict(
+  loess_model_2,
+  newdata = model_2_comparison_data
+)
+
+# Reshape for plotting
+model_2_comparison_data <- model_2_comparison_data %>%
+  pivot_longer(
+    cols = c(OLS, Quadratic, LOESS),
+    names_to = "Model",
+    values_to = "estimated_log_price"
+  ) %>%
+  mutate(
+    estimated_price = exp(estimated_log_price)
+  )
+```
+
+
+```{r model-2-comparison-log-log, fig.width=9, fig.height=5}
+ggplot() +
+  geom_point(
+    data = loess_data,
+    aes(x = log_sqft_living, y = log_price),
+    alpha = 0.15,
+    size = 0.8,
+    color = "gray50"
+  ) +
+  geom_line(
+    data = model_2_comparison_data,
+    aes(
+      x = log_sqft_living,
+      y = estimated_log_price,
+      color = Model
+    ),
+    linewidth = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "OLS" = "#C05A46",
+      "Quadratic" = "#4C956C",
+      "LOESS" = "#4472A5"
+    ),
+    breaks = c("OLS", "Quadratic", "LOESS")
+  ) +
+  labs(
+    title = "Relationship Between Log Living Area and Log Sale Price",
+    subtitle = "Comparison of simple OLS, quadratic OLS, and LOESS fits",
+    x = "Log of Living Area",
+    y = "Log of Sale Price",
+    color = "Trend Line"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+
+```{r model-2-comparison-exponentiated, fig.width=9, fig.height=5}
+ggplot() +
+  geom_point(
+    data = housing_exploration,
+    aes(x = sqft_living, y = price),
+    alpha = 0.15,
+    size = 0.8,
+    color = "gray50"
+  ) +
+  geom_line(
+    data = model_2_comparison_data,
+    aes(
+      x = sqft_living,
+      y = estimated_price,
+      color = Model
+    ),
+    linewidth = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "OLS" = "#C05A46",
+      "Quadratic" = "#4C956C",
+      "LOESS" = "#4472A5"
+    ),
+    breaks = c("OLS", "Quadratic", "LOESS")
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Relationship Between Living Area and Home Sale Price",
+    subtitle = "Comparison of back-transformed OLS, quadratic, and LOESS fits",
+    x = "Living Area (Sq. Ft.)",
+    y = "Home Sale Price",
+    color = "Trend Line",
+    caption = "Fitted curves represent estimated geometric mean sale prices."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+
+
+```{r}
+model_complete_linear <- lm(
+  log(price) ~ grade_ + log(sqft_living) + factor(zipcode),
+  data = housing_exploration
+)
+```
+
+
+```{r}
+model_complete_quadratic <- lm(
+  log(price) ~ grade_ + log(sqft_living) +
+    I(log(sqft_living)^2) + factor(zipcode),
+  data = housing_exploration
+)
+```
+
+
+
+```{r}
+waldtest(
+  model_complete_linear,
+  model_complete_quadratic,
+  vcov = vcovHC,
+  test = "F"
+)
+```
+
+
+
+```{r complete-model-predicted-actual-log, fig.width=8, fig.height=7}
+predicted_actual_data <- tibble(
+  actual_log_price = model.response(model.frame(model_complete_quadratic)),
+  predicted_log_price = fitted(model_complete_quadratic)
+) %>%
+  mutate(
+    actual_price = exp(actual_log_price),
+    predicted_price = exp(predicted_log_price)
+  )
+
+ggplot(
+  predicted_actual_data,
+  aes(x = actual_log_price, y = predicted_log_price)
+) +
+  geom_point(
+    alpha = 0.2,
+    size = 1,
+    color = "#4472A5"
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    color = "#C05A46",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  coord_equal() +
+  labs(
+    title = "Predicted vs. Actual Log Sale Prices",
+    subtitle = "Complete quadratic regression model; 30% exploration sample",
+    x = "Actual Log Sale Price",
+    y = "Predicted Log Sale Price",
+    caption = "Dashed line represents perfect agreement."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+
+```{r complete-model-predicted-actual, fig.width=8, fig.height=7}
+ggplot(
+  predicted_actual_data,
+  aes(x = actual_price, y = predicted_price)
+) +
+  geom_point(
+    alpha = 0.2,
+    size = 1,
+    color = "#4472A5"
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    color = "#C05A46",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  scale_y_continuous(labels = scales::label_dollar()) +
+  coord_equal() +
+  labs(
+    title = "Predicted vs. Actual Home Sale Prices",
+    subtitle = "Complete quadratic regression model; 30% exploration sample",
+    x = "Actual Sale Price",
+    y = "Predicted Sale Price",
+    caption = "Dashed line represents perfect agreement."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+
+```{r complete-model-residuals-vs-fitted, fig.width=9, fig.height=5}
+residual_data <- tibble(
+  fitted_log_price = fitted(model_complete_quadratic),
+  residual = residuals(model_complete_quadratic)
+)
+
+ggplot(residual_data, aes(x = fitted_log_price, y = residual)) +
+  geom_point(
+    alpha = 0.2,
+    size = 1,
+    color = "#4472A5"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "gray40"
+  ) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    se = FALSE,
+    color = "#C05A46",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Residuals vs. Fitted Values",
+    subtitle = "Complete quadratic regression model; 30% exploration sample",
+    x = "Fitted Log Sale Price",
+    y = "Residual (Log Scale)",
+    caption = "Red curve represents the LOESS trend in residuals."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title.position = "plot")
+```
+
+
+
+
+```{r model_2B-living-area_quadratic}
+model_2B <- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2),
+  data = housing_exploration
+)
+
+coeftest(model_2B, vcov. = vcovHC(model_2B))
+cat("R-squared:", round(summary(model_2B)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_2B)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_2B), "\n")
+```
+
+
+
+
+
+```{r model_4-zipcode}
+model_4 <- lm(
+  log(price) ~ factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_4, vcov. = vcovHC(model_4))
+cat("R-squared:", round(summary(model_4)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_4)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_4), "\n")
+```
+
+
+```{r model_4-zipcode}
+model_4 <- lm(
+  log(price) ~ factor(renovated),
+  data = housing_exploration
+)
+
+coeftest(model_4, vcov. = vcovHC(model_4))
+cat("R-squared:", round(summary(model_4)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_4)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_4), "\n")
+```
+
+
+
+
+```{r}
+model_6<- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_6, vcov. = vcovHC(model_6))
+cat("R-squared:", round(summary(model_6)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_6)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_6), "\n")
+```
+
+
+
+```{r model_2B-living-area_quadratic}
+model_2B <- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + grade_,
+  data = housing_exploration
+)
+
+coeftest(model_2B, vcov. = vcovHC(model_2B))
+cat("R-squared:", round(summary(model_2B)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_2B)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_2B), "\n")
+```
+
+
+
+
+
+```{r}
+model_6<- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + factor(zipcode) + grade_,
+  data = housing_exploration
+)
+
+coeftest(model_6, vcov. = vcovHC(model_6))
+cat("R-squared:", round(summary(model_6)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_6)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_6), "\n")
+```
+
+
+
+
+
+```{r}
+model_6<- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + factor(zipcode) + age,
+  data = housing_exploration
+)
+
+coeftest(model_6, vcov. = vcovHC(model_6))
+cat("R-squared:", round(summary(model_6)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_6)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_6), "\n")
+```
+
+
+
+
+
+
+```{r}
+model_6<- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + factor(zipcode) + (log(sqft_living) * factor(zipcode)) + grade_,
+  data = housing_exploration
+)
+
+coeftest(model_6, vcov. = vcovHC(model_6))
+cat("R-squared:", round(summary(model_6)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_6)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_6), "\n")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+model_6B <- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + log(sqft_living) * factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_6B, vcov. = vcovHC(model_6B))
+cat("R-squared:", round(summary(model_6B)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_6B)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_6B), "\n")
+```
+
+
+
+```{r}
+model_7 <- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2) + factor(zipcode) + factor(grade_),
+  data = housing_exploration
+)
+
+coeftest(model_7, vcov. = vcovHC(model_7))
+cat("R-squared:", round(summary(model_7)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7), "\n")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r model_6-grade-zip-code}
+model_6 <- lm(
+  log(price) ~ grade_ + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_6, vcov. = vcovHC(model_6))
+cat("R-squared:", round(summary(model_6)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_6)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_6), "\n")
+```
+
+
+
+```{r model_7-grade-living-area-zipcode}
+model_7 <- lm(
+  log(price) ~ grade_ + log(sqft_living) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_7, vcov. = vcovHC(model_7))
+cat("R-squared:", round(summary(model_7)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7), "\n")
+```
+
+
+```{r model_7B-grade-living-area-zipcode}
+model_7B <- lm(
+  log(price) ~ grade_ + log(sqft_living) + I(log(sqft_living)^2) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_7B, vcov. = vcovHC(model_7B))
+cat("R-squared:", round(summary(model_7B)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7B)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7B), "\n")
+```
+
+
+
+```{r model_7C-grade-living-area-zipcode}
+model_7C <- lm(
+  log(price) ~ grade_ + log(sqft_living) + I(log(sqft_living)^2) + (grade_ * log(sqft_living)) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_7C, vcov. = vcovHC(model_7C))
+cat("R-squared:", round(summary(model_7C)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7C)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7C), "\n")
+```
+
+
+```{r model_7D-grade-living-area-interaction-zipcode}
+model_7D <- lm(
+  log(price) ~ grade_ * log(sqft_living) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_7D, vcov. = vcovHC(model_7D))
+
+cat("R-squared:", round(summary(model_7D)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7D)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7D), "\n")
+```
+
+
+```{r model_7D2-grade-living-area-interaction-zipcode}
+model_7D2 <- lm(
+  log(price) ~ grade_ * log(sqft_living) + grade_ * I(log(sqft_living)^2) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_7D2, vcov. = vcovHC(model_7D2))
+
+cat("R-squared:", round(summary(model_7D2)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7D2)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7D2), "\n")
+```
+
+
+
+
+```{r model_7E-grade-living-area}
+model_7E <- lm(
+  log(price) ~ grade_ * log(sqft_living),
+  data = housing_exploration
+)
+
+coeftest(model_7E, vcov. = vcovHC(model_7E))
+
+cat("R-squared:", round(summary(model_7E)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7E)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7E), "\n")
+```
+
+
+
+
+
+
+
+```{r model_7F-grade-living-area}
+model_7F <- lm(
+  log(price) ~ grade_ * log(sqft_living),
+  data = housing_exploration
+)
+
+coeftest(model_7F, vcov. = vcovHC(model_7F))
+
+cat("R-squared:", round(summary(model_7F)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7F)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7F), "\n")
+```
+
+
+```{r model_7G-grade-living-area}
+model_7G <- lm(
+  log(price) ~ grade_ + log(sqft_living) + (grade_ * log(sqft_living)),
+  data = housing_exploration
+)
+
+coeftest(model_7G, vcov. = vcovHC(model_7G))
+
+cat("R-squared:", round(summary(model_7G)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_7G)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_7G), "\n")
+```
+
+
+
+
+
+```{r model_8-grade-living-area-zipcode-age}
+model_8 <- lm(
+  log(price) ~ grade_ + log(sqft_living) + factor(zipcode) + age + I(age^2),
+  data = housing_exploration
+)
+
+coeftest(model_8, vcov. = vcovHC(model_8))
+cat("R-squared:", round(summary(model_8)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_8)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_8), "\n")
+```
+
+```{r model_9-grade-living-area-zipcode}
+model_9 <- lm(
+  log(price) ~ grade_ + log(sqft_living) + (grade_ * (log(sqft_living))) + factor(zipcode),
+  data = housing_exploration
+)
+
+coeftest(model_9, vcov. = vcovHC(model_9))
+cat("R-squared:", round(summary(model_9)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_9)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_9), "\n")
+```
+
+
+```{r model_10-grade-living-area}
+model_10 <- lm(
+  log(price) ~ grade_ + log(sqft_living) + (grade_ * (log(sqft_living))),
+  data = housing_exploration
+)
+
+coeftest(model_10, vcov. = vcovHC(model_10))
+cat("R-squared:", round(summary(model_10)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_10)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_10), "\n")
+```
+
+
