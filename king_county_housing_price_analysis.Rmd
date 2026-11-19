@@ -1,0 +1,896 @@
+---
+title: "Understanding Home Sale Prices in King County"
+subtitle: "A Multiple Regression Analysis of Living Area and Construction Quality, Controlling for Geographic Location"
+author: "Francis Elicaño"
+date: "November 2026"
+output:
+  pdf_document:
+    toc: false
+header-includes:
+  - \usepackage{float}
+params:
+  data_file: "housing_confirmation.csv"
+  random_seed: 123
+---
+
+
+```{r installations, include=FALSE}
+# install.packages("emmeans")
+# install.packages("patchwork")
+```
+
+```{r install-confirmation, include=FALSE}
+# packageVersion("patchwork")
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(lmtest)
+library(sandwich)
+library(stargazer)
+library(emmeans)
+library(patchwork)
+```
+
+
+```{r , include=FALSE}
+housing_confirmation <- read_csv(
+  "housing_confirmation.csv",
+  col_types = cols(
+    id = col_character(),
+    date = col_character(),
+    zipcode = col_character(),
+    grade_ = col_character()
+  )
+) %>%
+  mutate(
+    grade_ = factor(
+      grade_,
+      levels = c("7", "1-5", "6", as.character(8:11), "12-13")
+    )
+  )
+```
+
+
+
+```{r model-basic-grade, include=FALSE}
+model_grade_only <- lm(
+  log(price) ~ grade_,
+  data = housing_confirmation
+)
+
+robust_grade_only <- coeftest(
+  model_grade_only,
+  vcov. = vcovHC(model_grade_only, type = "HC3")
+)
+
+robust_grade_only
+
+cat("R-squared:", round(summary(model_grade_only)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_grade_only)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_grade_only), "\n")
+```
+
+
+```{r model-basic-sqft, include=FALSE}
+model_sqft_living <- lm(
+  log(price) ~ log(sqft_living) + I(log(sqft_living)^2),
+  data = housing_confirmation
+)
+
+robust_sqft_living <- coeftest(
+  model_sqft_living,
+  vcov. = vcovHC(model_sqft_living, type = "HC3")
+)
+
+robust_sqft_living
+
+cat("R-squared:", round(summary(model_sqft_living)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_sqft_living)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_sqft_living), "\n")
+```
+
+
+
+```{r model-complete, include=FALSE}
+model_complete <- lm(
+  log(price) ~ grade_ + log(sqft_living) +
+    I(log(sqft_living)^2) + factor(zipcode),
+  data = housing_confirmation
+)
+
+robust_complete <- coeftest(
+  model_complete,
+  vcov. = vcovHC(model_complete, type = "HC3")
+)
+
+robust_complete
+
+cat("R-squared:", round(summary(model_complete)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_complete)$adj.r.squared, 4), "\n")
+cat("Observations:", nobs(model_complete), "\n")
+```
+
+
+
+# Introduction
+
+Home sale prices vary substantially across properties, reflecting differences
+in physical characteristics, construction quality, and geographic location.
+Understanding how these factors are associated with home prices can provide
+valuable insights for homebuyers, sellers, real estate professionals, and
+other housing market participants.
+
+While larger homes and homes with higher construction grades generally
+command higher prices, these characteristics are also related to one another.
+Furthermore, differences in geographic location may contribute substantially
+to differences in home sale prices. Multiple regression allows these
+relationships to be examined while controlling for other characteristics.
+
+This study uses residential property sales in King County, Washington,
+from May 28, 2014, to May 27, 2015, to address the following research questions.
+
+## Research Questions
+
+1. Is construction grade associated with home sale prices, controlling
+   for living area and geographic location?
+
+2. How is living area associated with home sale prices, controlling
+   for construction grade and geographic location?
+
+The objective of this study is to identify and quantify these associations
+rather than establish causal relationships (experimentation realm) or develop a predictive model for home sale prices (machine learning realm).
+
+
+# Research Question 1
+
+***Is construction grade associated with home sale prices, controlling for
+living area and geographic location?***
+
+Construction grade exhibits a strong positive association with home sale prices. This relationship persists after controlling for living area and geographic location, although its magnitude is substantially reduced. Before adjustment, the estimated geometric mean sale price ranges from approximately $220,000 for Grades 1–5 to $2 million for Grades 12–13. After adjustment, this range narrows to approximately $375,000 to $850,000.
+
+These findings suggest that differences in living area and geographic location account for a substantial portion of the unadjusted association. Nevertheless, higher construction grades remain positively and statistically significantly associated with home sale prices after accounting for these characteristics.
+
+```{r grade-only-regression-plot, echo=FALSE, fig.width=9, fig.height=5}
+grade_estimates <- emmeans(
+  model_grade_only,
+  ~ grade_,
+  vcov. = vcovHC(model_grade_only, type = "HC3")
+)
+
+grade_plot_data <- as.data.frame(
+  confint(grade_estimates, type = "response")
+)
+
+  grade_plot_unadjusted <- ggplot(
+    grade_plot_data, aes(x = grade_, y = response)
+  ) +
+  geom_errorbar(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    width = 0.15,
+    color = "#38658D"
+  ) +
+  geom_point(size = 3, color = "#38658D") +
+  scale_x_discrete(
+    limits = c("1-5", "6", "7", as.character(8:11), "12-13")
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar(),
+    limits = c(200000, 2500000),
+    breaks = c(200000, 300000, 500000, 1000000, 2000000)
+  ) +
+  labs(
+    title = "Estimated Home Sale Price by Construction Grade",
+    subtitle = "Unadjusted estimates with 95% robust confidence intervals",
+    x = "Construction Grade",
+    y = "Estimated Geometric Mean Sale Price (USD, log scale)"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+
+```{r complete-grade-plot, echo=FALSE, fig.width=9, fig.height=5}
+mean_living_area <- mean(
+  housing_confirmation$sqft_living,
+  na.rm = TRUE
+)
+
+complete_grade_estimates <- emmeans(
+  model_complete,
+  ~ grade_,
+  at = list(sqft_living = mean_living_area),
+  nuisance = "zipcode",
+  wt.nuis = "proportional",
+  weights = "proportional",
+  vcov. = vcovHC(model_complete, type = "HC3")
+)
+
+complete_grade_plot_data <- as.data.frame(
+  confint(complete_grade_estimates, type = "response")
+)
+
+grade_plot_adjusted <- ggplot(
+  complete_grade_plot_data,
+  aes(x = grade_, y = response)
+) +
+  geom_errorbar(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    width = 0.15,
+    color = "#38658D"
+  ) +
+  geom_point(
+    size = 3,
+    color = "#38658D"
+  ) +
+  scale_x_discrete(
+    limits = c("1-5", "6", "7", as.character(8:11), "12-13")
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar(),
+    limits = c(200000, 2500000),
+    breaks = c(200000, 300000, 500000, 1000000, 2000000)
+  ) +
+  labs(
+    title = "Adjusted Relationship Between Construction Grade and Home Sale Price",
+    subtitle = paste0(
+      "Controlling for living area (",
+      scales::comma(round(mean_living_area)),
+      " sq. ft.) and ZIP code"
+    ),
+    x = "Construction Grade",
+    y = "Estimated Geometric Mean Sale Price (USD, log scale)",
+    caption = paste(
+      "ZIP codes weighted by sample proportions.",
+      "Error bars represent 95% robust confidence intervals.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r grade-plots-combined, echo=FALSE, fig.width=11, fig.height=5}
+patchwork::wrap_plots(
+  grade_plot_unadjusted +
+    labs(
+      title = "Unadjusted",
+      subtitle = NULL,
+      caption = NULL
+    ),
+  grade_plot_adjusted +
+    labs(
+      title = "Adjusted",
+      subtitle = NULL,
+      caption = NULL
+    ),
+  ncol = 2,
+  axes = "collect_y",
+  axis_titles = "collect"
+) +
+  patchwork::plot_annotation(
+    title = "Relationship Between Construction Grade and Home Sale Price",
+    caption = paste(
+      paste0(
+        "Adjusted estimates hold living area constant at ",
+        scales::comma(round(mean_living_area)),
+        " sq. ft., with ZIP codes weighted by sample proportions."
+      ),
+      "Error bars represent 95% robust confidence intervals.",
+      sep = "\n"
+    )
+  )
+```
+
+
+
+# Research Question 2
+
+***How is living area associated with home sale prices, controlling for
+construction grade and geographic location?***
+
+Living area exhibits a positive, nonlinear association with home sale prices. This relationship persists after controlling for construction grade and geographic location, although both the steepness and curvature of the relationship are substantially reduced.
+
+The quadratic coefficient decreases from 0.39 to 0.14 after adjustment, representing an approximately 65% reduction in curvature on the log-log scale. Nevertheless, the quadratic term remains statistically significant, indicating that the percentage increase in estimated sale price associated with a given percentage increase in living area is greater for larger homes.
+
+These findings suggest that differences in construction grade and geographic location partially account for the strong nonlinear relationship observed before adjustment.
+
+```{r living-area-plot-preparation, include=FALSE}
+log_scatter_data <- housing_confirmation %>%
+  filter(
+    !is.na(price),
+    !is.na(sqft_living),
+    price > 0,
+    sqft_living > 0
+  )
+
+# Shared living area range
+living_area_range <- quantile(
+  log_scatter_data$sqft_living,
+  probs = c(0.01, 0.99),
+  na.rm = TRUE
+)
+
+sqft_grid <- exp(seq(
+  log(living_area_range[1]),
+  log(living_area_range[2]),
+  length.out = 500
+))
+
+# Unadjusted estimates
+sqft_living_estimates <- emmeans(
+  model_sqft_living,
+  ~ sqft_living,
+  at = list(sqft_living = sqft_grid),
+  vcov. = vcovHC(model_sqft_living, type = "HC3")
+)
+
+sqft_living_plot_data <- as.data.frame(
+  confint(sqft_living_estimates, type = "response")
+)
+
+# Adjusted estimates
+complete_living_estimates <- emmeans(
+  model_complete,
+  ~ sqft_living,
+  at = list(sqft_living = sqft_grid),
+  nuisance = c("grade_", "zipcode"),
+  wt.nuis = "proportional",
+  weights = "proportional",
+  vcov. = vcovHC(model_complete, type = "HC3")
+)
+
+complete_living_plot_data <- as.data.frame(
+  confint(complete_living_estimates, type = "response")
+)
+
+# Shared axis limits
+living_area_x_limits <- range(
+  log_scatter_data$sqft_living,
+  na.rm = TRUE
+)
+
+living_area_y_limits <- range(
+  c(
+    log_scatter_data$price,
+    sqft_living_plot_data$lower.CL,
+    sqft_living_plot_data$upper.CL,
+    complete_living_plot_data$lower.CL,
+    complete_living_plot_data$upper.CL
+  ),
+  na.rm = TRUE
+)
+```
+
+
+```{r sqft-living-log-log-plot, echo=FALSE, fig.width=9, fig.height=6}
+living_area_plot_unadjusted <- ggplot() +
+  geom_point(
+    data = log_scatter_data,
+    aes(x = sqft_living, y = price),
+    alpha = 0.16,
+    size = 0.7,
+    color = "#38658D"
+  ) +
+  geom_ribbon(
+    data = sqft_living_plot_data,
+    aes(x = sqft_living, ymin = lower.CL, ymax = upper.CL),
+    fill = "#C05A46",
+    alpha = 0.20
+  ) +
+  geom_line(
+    data = sqft_living_plot_data,
+    aes(x = sqft_living, y = response),
+    color = "#C05A46",
+    linewidth = 1
+  ) +
+  scale_x_log10(
+    labels = scales::label_comma(),
+    limits = living_area_x_limits
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar(),
+    limits = living_area_y_limits
+  ) +
+  labs(
+    title = "Unadjusted Relationship Between Living Area and Sale Price",
+    subtitle = "Quadratic log-log regression without controls",
+    x = "Living Area (Sq. Ft., log scale)",
+    y = "Home Sale Price (USD, log scale)",
+    caption = paste(
+      "Points represent observed home sale prices.",
+      "Fitted curve represents the estimated geometric mean sale price.",
+      "Fitted curve restricted to the 1st–99th percentiles of living area.",
+      "Shaded region represents the 95% robust confidence interval.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+
+```{r complete-living-area-log-plot, echo=FALSE, fig.width=9, fig.height=6}
+  living_area_plot_adjusted <- ggplot(
+    complete_living_plot_data,
+    aes(x = sqft_living, y = response)
+  ) +
+  geom_ribbon(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    fill = "#C05A46",
+    alpha = 0.20
+  ) +
+  geom_line(
+    color = "#C05A46",
+    linewidth = 1
+  ) +
+  scale_x_log10(
+    labels = scales::label_comma(),
+    limits = living_area_x_limits
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar(),
+    limits = living_area_y_limits
+  ) +
+  labs(
+    title = "Adjusted Relationship Between Living Area and Sale Price",
+    subtitle = "Controlling for construction grade and ZIP code",
+    x = "Living Area (Sq. Ft., log scale)",
+    y = "Home Sale Price (USD, log scale)",
+    caption = paste(
+      "Construction grade and ZIP code weighted by sample proportions.",
+      "Fitted curve represents the estimated geometric mean sale price.",
+      "Fitted curve restricted to the 1st–99th percentiles of living area.",
+      "Shaded region represents the 95% robust confidence interval.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r living-area-plots-combined, echo=FALSE, fig.width=11, fig.height=5}
+patchwork::wrap_plots(
+  living_area_plot_unadjusted +
+    labs(
+      title = "Unadjusted",
+      subtitle = NULL,
+      caption = NULL
+    ),
+  living_area_plot_adjusted +
+    labs(
+      title = "Adjusted",
+      subtitle = NULL,
+      caption = NULL
+    ),
+  ncol = 2,
+  axes = "collect_y",
+  axis_titles = "collect"
+) +
+  patchwork::plot_annotation(
+    title = "Relationship Between Living Area and Home Sale Price",
+    caption = paste(
+      "Points represent observed home sale prices.",
+      "Adjusted estimates weight construction grade and ZIP code by sample proportions.",
+      "Fitted curves represent estimated geometric mean sale prices.",
+      "Fitted curves restricted to the 1st–99th percentiles of living area.",
+      "Shaded regions represent 95% robust confidence intervals.",
+      sep = "\n"
+    )
+  )
+```
+
+
+
+\clearpage
+
+# Models
+
+The primary variables of interest, construction grade and living area, both exhibit statistically significant associations with home sale prices. Among the additional property characteristics evaluated during exploration, ZIP code provided the only meaningful improvement in descriptive power and was therefore included to account for geographic differences in home sale prices.
+
+The complete model incorporates a quadratic log-log specification for living area to capture the nonlinear relationship between living area and home sale price.
+
+
+```{r stargazer-combined, echo=FALSE, results='asis'}
+stargazer(
+  model_grade_only,
+  model_sqft_living,
+  model_complete,
+  type = "latex",
+  title = "Association Between Housing Characteristics and Home Sale Price",
+  dep.var.labels = "Log of Home Sale Price",
+  column.labels = c(
+    "Grade Only",
+    "Living Area Only",
+    "Complete Model"
+  ),
+  covariate.labels = c(
+    "Grade 1-5",
+    "Grade 6",
+    "Grade 8",
+    "Grade 9",
+    "Grade 10",
+    "Grade 11",
+    "Grade 12-13",
+    "Log of Living Area",
+    "Squared Log of Living Area"
+  ),
+  se = list(
+    robust_grade_only[, 2],
+    robust_sqft_living[, 2],
+    robust_complete[, 2]
+  ),
+  t = list(
+    robust_grade_only[, 3],
+    robust_sqft_living[, 3],
+    robust_complete[, 3]
+  ),
+  p = list(
+    robust_grade_only[, 4],
+    robust_sqft_living[, 4],
+    robust_complete[, 4]
+  ),
+  t.auto = FALSE,
+  p.auto = FALSE,
+  omit = "factor\\(zipcode\\)",
+  add.lines = list(
+    c("ZIP Code Fixed Effects", "No", "No", "Yes")
+  ),
+  digits = 4,
+  keep.stat = c("n", "rsq", "adj.rsq"),
+  notes = "HC3 robust standard errors in parentheses. Reference: Grade 7.",
+  font.size = "small",
+  table.placement = "H",
+  header = FALSE
+)
+```
+
+
+
+\clearpage
+
+# Model Fit and Diagnostics
+
+The predicted and actual home sale prices exhibit close agreement, with most
+observations concentrated around the 45-degree reference line, indicating a strong
+overall model fit. However, the model tends to overestimate the prices of some
+lower-priced homes and underestimate the prices of some higher-priced homes.
+
+```{r complete-model-predicted-actual, echo=FALSE, fig.width=8, fig.height=7, out.width="50%", fig.align="center"}
+predicted_actual_data <- tibble(
+  actual_log_price = model.response(model.frame(model_complete)),
+  predicted_log_price = fitted(model_complete)
+) %>%
+  mutate(
+    actual_price = exp(actual_log_price),
+    predicted_price = exp(predicted_log_price)
+  )
+
+price_range <- range(
+  c(
+    predicted_actual_data$actual_price,
+    predicted_actual_data$predicted_price
+  )
+)
+
+ggplot(
+  predicted_actual_data,
+  aes(x = actual_price, y = predicted_price)
+) +
+  geom_point(
+    alpha = 0.16,
+    size = 0.7,
+    color = "#38658D"
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    color = "#C05A46",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  scale_x_log10(
+    labels = scales::label_dollar(),
+    limits = price_range
+  ) +
+  scale_y_log10(
+    labels = scales::label_dollar(),
+    limits = price_range
+  ) +
+  coord_equal() +
+  labs(
+    title = "Predicted vs. Actual Home Sale Prices",
+    subtitle = "Complete quadratic regression model; confirmation sample",
+    x = "Actual Sale Price (USD, log scale)",
+    y = "Predicted Sale Price (USD, log scale)",
+    caption = paste(
+      "Dashed line represents perfect agreement.",
+      "Fitted values represent estimated geometric mean sale prices.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+
+
+The residuals are generally centered around zero, with the LOESS trend line
+remaining relatively flat across the range of fitted values. This suggests that the
+model adequately captures the overall functional relationship between the
+explanatory variables and log sale price. While some variation in residual
+dispersion is observed, there is no pronounced pattern of heteroskedasticity.
+Nevertheless, heteroskedastic robust standard errors are used to ensure more
+reliable statistical inference.
+
+```{r complete-model-residuals-vs-fitted, echo=FALSE, fig.width=9, fig.height=5, out.width="50%", fig.align="center"}
+residual_data <- tibble(
+  fitted_log_price = fitted(model_complete),
+  residual = residuals(model_complete)
+)
+
+ggplot(residual_data, aes(x = fitted_log_price, y = residual)) +
+  geom_point(
+    alpha = 0.16,
+    size = 0.7,
+    color = "#38658D"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "gray40"
+  ) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    se = FALSE,
+    color = "#C05A46",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Residuals vs. Fitted Values",
+    subtitle = "Complete quadratic regression model; confirmation sample",
+    x = "Fitted Log Sale Price",
+    y = "Residual (Log Scale)",
+    caption = paste(
+      "Red curve represents the LOESS trend in residuals.",
+      "Dashed line represents zero residual.",
+      sep = "\n"
+    )
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+
+
+
+# Methodology
+
+## Satisfying Large Sample Linear Regression Model Requirements
+
+### 1. Independent and Identically Distributed (IID)
+
+Independence of home sale price data is plausible, but not perfect. Home sellers
+typically benchmark prices of homes sold in their area so there would be some geographic clustering effect because of this. Also, there are times although probably less often when someone would sell their home in King County then would buy a home also in King County. When this happens, how much they sell their may carry some information on how much they would buy their next home.
+
+### 2. A Unique Best Linear Predictor (BLP) Exists
+
+**a. No Infinite Variance**
+
+Sales price and living area both have heavy right tails indicating possible
+inifinite variance. To eliminate the heavy tail, a log transform is performed.
+
+```{r price-distributions, echo=FALSE, fig.width=10, fig.height=4.5}
+price_distribution_data <- housing_confirmation %>%
+  filter(!is.na(price), price > 0) %>%
+  mutate(log_price = log(price))
+
+# Original price distribution
+price_plot_raw <- ggplot(price_distribution_data, aes(x = price)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_dollar()) +
+  labs(
+    title = "Home Sale Price",
+    x = "Sale Price (USD)",
+    y = "Number of Homes"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Log-transformed price distribution
+price_plot_log <- ggplot(price_distribution_data, aes(x = log_price)) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  labs(
+    title = "Log of Home Sale Price",
+    x = "Log Sale Price",
+    y = "Number of Homes"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Combine charts with shared title and caption
+patchwork::wrap_plots(
+  price_plot_raw,
+  price_plot_log,
+  ncol = 2
+) +
+  patchwork::plot_annotation(
+    title = "Distribution of Home Sale Prices",
+    caption = "Confirmation sample"
+  )
+```
+
+
+```{r living-area-distributions, echo=FALSE, fig.width=10, fig.height=4.5}
+living_area_distribution_data <- housing_confirmation %>%
+  filter(!is.na(sqft_living), sqft_living > 0) %>%
+  mutate(log_sqft_living = log(sqft_living))
+
+# Original living area distribution
+living_area_plot_raw <- ggplot(
+  living_area_distribution_data, aes(x = sqft_living)
+) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Living Area",
+    x = "Living Area (Sq. Ft.)",
+    y = "Number of Homes"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Log-transformed living area distribution
+living_area_plot_log <- ggplot(
+  living_area_distribution_data, aes(x = log_sqft_living)
+) +
+  geom_histogram(
+    bins = 35,
+    fill = "#4472A5",
+    color = "white"
+  ) +
+  labs(
+    title = "Log of Living Area",
+    x = "Log Living Area",
+    y = "Number of Homes"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Combine charts with shared title and caption
+patchwork::wrap_plots(
+  living_area_plot_raw,
+  living_area_plot_log,
+  ncol = 2
+) +
+  patchwork::plot_annotation(
+    title = "Distribution of Living Area",
+    caption = "Confirmation sample"
+  )
+```
+
+**b. No perfect collinearity between X variables**
+
+There is no perfect collinearity between construction grade, living area, and zip
+code as they are all showing up as statistically significant variables in the
+complete model.
+
+
+## Heteroskedastic Robust Standard Errors
+
+Used the heteroskedastic robust standard errors (HC3) so that the homoskedastic
+error assumption of the classical linear regression model would not have to be
+satisfied. Because of the large sample size (~14,000), the loss of power resulting
+from using heteroskedastic standard errors is minimized.
+
+
+## Exploration and Confirmation Samples
+
+To reduce the risk of false-positive findings arising from data-driven model
+selection, data exploration and model development were performed on a randomly
+selected 30% of the approximately 20,000 observations. The remaining 70% were used
+to estimate the selected regression models and assess whether the findings from the
+exploration sample persisted.
+
+
+# APPENDIX
+
+## Correlation Matrix
+
+```{r confirmation-correlation-matrix, echo=FALSE, fig.width=8, fig.height=6}
+correlation_variables <- c(
+  "price",
+  "grade",
+  "sqft_living",
+  "sqft_lot",
+  "age",
+  "condition",
+  "renovated"
+)
+
+correlation_data <- housing_confirmation %>%
+  select(all_of(correlation_variables))
+
+correlation_matrix <- cor(
+  correlation_data,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+# Prepare data for heatmap
+correlation_plot_data <- as.data.frame(
+  as.table(correlation_matrix)
+)
+
+colnames(correlation_plot_data) <- c(
+  "Variable1", "Variable2", "Correlation"
+)
+
+# Report-friendly variable labels
+correlation_labels <- c(
+  price = "Sale Price",
+  grade = "Construction Grade",
+  sqft_living = "Living Area",
+  sqft_lot = "Lot Area",
+  age = "Age",
+  condition = "Condition",
+  renovated = "Renovated"
+)
+
+ggplot(
+  correlation_plot_data,
+  aes(x = Variable1, y = Variable2, fill = Correlation)
+) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = sprintf("%.2f", Correlation)),
+    size = 3.5
+  ) +
+  scale_fill_gradient2(
+    low = "#38658D",
+    mid = "white",
+    high = "#B35806",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Spearman \u03c1"
+  ) +
+  scale_x_discrete(
+    limits = correlation_variables,
+    labels = correlation_labels
+  ) +
+  scale_y_discrete(
+    limits = rev(correlation_variables),
+    labels = correlation_labels
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlations Among Key Housing Variables",
+    subtitle = "Spearman rank correlation",
+    x = NULL,
+    y = NULL,
+    caption = "Confirmation sample"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+
